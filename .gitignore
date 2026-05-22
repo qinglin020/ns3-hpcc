@@ -9,4 +9,4 @@ simulation/.waf3-*/
 
 # Large trace files (5GB+, regenerate locally by re-running simulation)
 simulation/mix/*.tr
-simulation/pfc.txt
+simulation/mix/pfc.txt
