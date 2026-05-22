@@ -6,3 +6,7 @@ simulation/.waf3-*/
 
 # Python bytecode
 *.pyc
+
+# Large trace files (5GB+, regenerate locally by re-running simulation)
+simulation/mix/*.tr
+simulation/pfc.txt
