@@ -174,6 +174,76 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(65536),
 				MakeUintegerAccessor(&RdmaHw::pint_smpl_thresh),
 				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("MpcCcAI",
+				"MPC-CC probe phase increase ratio per RTT",
+				DoubleValue(0.3),
+				MakeDoubleAccessor(&RdmaHw::m_mpccc_ai),
+				MakeDoubleChecker<double>())
+		.AddAttribute("MpcCcWq",
+				"MPC-CC queue deviation weight",
+				DoubleValue(1.0),
+				MakeDoubleAccessor(&RdmaHw::m_mpccc_wq),
+				MakeDoubleChecker<double>())
+		.AddAttribute("MpcCcWdu",
+				"MPC-CC rate smoothness weight",
+				DoubleValue(0.01),
+				MakeDoubleAccessor(&RdmaHw::m_mpccc_wdu),
+				MakeDoubleChecker<double>())
+		.AddAttribute("MpcCcQLow",
+				"MPC-CC probe threshold as fraction of BDP",
+				DoubleValue(0.1),
+				MakeDoubleAccessor(&RdmaHw::m_mpccc_q_low),
+				MakeDoubleChecker<double>())
+		.AddAttribute("MpcCcQRef",
+				"MPC-CC target queue as fraction of BDP (normalized)",
+				DoubleValue(0.2),
+				MakeDoubleAccessor(&RdmaHw::m_mpccc_q_ref),
+				MakeDoubleChecker<double>())
+		.AddAttribute("MpcCcNEst",
+				"MPC-CC estimated number of competing flows",
+				DoubleValue(4.0),
+				MakeDoubleAccessor(&RdmaHw::m_mpccc_n_est),
+				MakeDoubleChecker<double>())
+		.AddAttribute("MpcCcHorizon",
+				"MPC-CC prediction horizon (steps)",
+				UintegerValue(8),
+				MakeUintegerAccessor(&RdmaHw::m_mpccc_horizon),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("ReccSigma",
+				"RECC RTT band factor sigma",
+				DoubleValue(0.2),
+				MakeDoubleAccessor(&RdmaHw::m_recc_sigma),
+				MakeDoubleChecker<double>())
+		.AddAttribute("ReccK",
+				"RECC target RTT multiplier k",
+				UintegerValue(1),
+				MakeUintegerAccessor(&RdmaHw::m_recc_k),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("ReccRai",
+				"RECC additive increase step R_ai",
+				DataRateValue(DataRate("100Mb/s")),
+				MakeDataRateAccessor(&RdmaHw::m_recc_rai),
+				MakeDataRateChecker())
+		.AddAttribute("ReccMaxCnt",
+				"RECC maximum cnt counter",
+				UintegerValue(20),
+				MakeUintegerAccessor(&RdmaHw::m_recc_maxCnt),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("ReccBeta",
+				"RECC rate decrease factor beta",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_recc_beta),
+				MakeDoubleChecker<double>())
+		.AddAttribute("ReccDecMax",
+				"RECC maximum decrease factor dec_max",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_recc_decMax),
+				MakeDoubleChecker<double>())
+		.AddAttribute("ReccGamma",
+				"RECC HBS correction factor gamma",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_recc_gamma),
+				MakeDoubleChecker<double>())
 		;
 	return tid;
 }
@@ -249,8 +319,16 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 		}
 	}else if (m_cc_mode == 7){
 		qp->tmly.m_curRate = m_bps;
+	}else if (m_cc_mode == 9){
+		qp->mpccc.m_curRate = m_bps;
+		qp->mpccc.m_nEstAdapt = m_mpccc_n_est;
 	}else if (m_cc_mode == 10){
 		qp->hpccPint.m_curRate = m_bps;
+	}else if (m_cc_mode == 11){
+		qp->recc.m_curRate = m_bps;
+		qp->recc.m_targetRate = m_bps;
+		qp->recc.m_cnt = 1;
+		qp->recc.m_rttMin = qp->m_baseRtt;
 	}
 
 	// Notify Nic
@@ -379,8 +457,16 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch){
 			}
 		}else if (m_cc_mode == 7){
 			qp->tmly.m_curRate = dev->GetDataRate();
+		}else if (m_cc_mode == 9){
+			qp->mpccc.m_curRate = dev->GetDataRate();
+			qp->mpccc.m_nEstAdapt = m_mpccc_n_est;
 		}else if (m_cc_mode == 10){
 			qp->hpccPint.m_curRate = dev->GetDataRate();
+		}else if (m_cc_mode == 11){
+			qp->recc.m_curRate = dev->GetDataRate();
+			qp->recc.m_targetRate = dev->GetDataRate();
+			qp->recc.m_cnt = 1;
+			qp->recc.m_rttMin = qp->m_baseRtt;
 		}
 	}
 	return 0;
@@ -429,8 +515,12 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		HandleAckTimely(qp, p, ch);
 	}else if (m_cc_mode == 8){
 		HandleAckDctcp(qp, p, ch);
+	}else if (m_cc_mode == 9){
+		HandleAckMpcCc(qp, p, ch);
 	}else if (m_cc_mode == 10){
 		HandleAckHpPint(qp, p, ch);
+	}else if (m_cc_mode == 11){
+		HandleAckRecc(qp, p, ch);
 	}
 	// ACK may advance the on-the-fly window, allowing more packets to send
 	dev->TriggerTransmit();
@@ -1101,6 +1191,234 @@ void RdmaHw::UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader
                                qp->hpccPint.m_lastUpdateSeq = next_seq; //+ rand() % 2 * m_mtu;
                }
        }
+}
+
+/**********************
+ * MPC-CC
+ * RTT/ECN-based congestion control using Model Predictive Control
+ * No INT required; targets cloud-edge-end heterogeneous scenarios
+ **********************/
+void RdmaHw::HandleAckMpcCc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch){
+	uint32_t ack_seq = ch.ack.seq;
+	uint8_t cnp = (ch.ack.flags >> qbbHeader::FLAG_CNP) & 1;
+
+	// accumulate ECN within this RTT batch
+	qp->mpccc.m_ecnCnt += (cnp > 0);
+
+	if (ack_seq <= qp->mpccc.m_lastUpdateSeq)
+		return; // not yet a full RTT
+
+	// ── Measure RTT ────────────────────────────────────────────────────
+	uint64_t rtt = Simulator::Now().GetTimeStep() - ch.ack.ih.ts; // nanoseconds
+	uint64_t rtt_base = qp->m_baseRtt; // nanoseconds (set from topology)
+	if (rtt_base == 0) rtt_base = rtt;
+
+	// ── Queue estimation: RTT → queue bytes ────────────────────────────
+	uint64_t link_bps = qp->m_max_rate.GetBitRate();
+	double q_est = 0.0;
+	if (rtt > rtt_base)
+		q_est = (double)(rtt - rtt_base) * 1e-9 * (double)link_bps / 8.0;
+
+	// ECN correction (compensates for RTT measurement lag at high load)
+	double ecn_thresh_bytes = 150000.0;
+	double ecn_ratio = 0.0;
+	if (qp->mpccc.m_batchSize > 0)
+		ecn_ratio = std::min(1.0, (double)qp->mpccc.m_ecnCnt / qp->mpccc.m_batchSize);
+	q_est += 0.5 * ecn_ratio * ecn_thresh_bytes;
+
+	// ── Thresholds (based on base RTT, not measured RTT) ───────────────
+	double bdp = (double)rtt_base * 1e-9 * (double)link_bps / 8.0;
+	if (bdp < 1.0) bdp = 1.0;
+	double q_low = m_mpccc_q_low * bdp;
+	double r_min  = m_minRate.GetBitRate();
+	double r_max  = (double)link_bps;
+
+	// ── Phase decision ──────────────────────────────────────────────────
+	bool in_mpc = (q_est >= q_low || ecn_ratio > 0.0);
+
+	// ── Starvation escape constants ────────────────────────────────────────
+	// When a flow is stuck at u_min, its RTT estimate is dominated by queue
+	// from competing flows rather than its own contribution.  The MPC solver
+	// therefore keeps assigning u_min in a self-reinforcing loop.
+	// Fix: after T_probe consecutive RTTs at u_min, bypass MPC entirely and
+	// hold the rate at C_share for N_recover RTTs so the flow can drain its
+	// own queue contribution and resume normal MPC afterwards.
+	// Encoding: m_uMinCnt in [0, T_probe)       → counting starvation
+	//           m_uMinCnt in [T_probe, T_probe+N_recover) → in recovery
+	const uint32_t T_probe   = 3;
+	const uint32_t N_recover = 10;
+	// Adaptive N_est: decay toward 1 when probing (uncongested), recover to
+	// configured max when MPC is active (congested).  Bounds: [1, m_mpccc_n_est].
+	double n_adapt = qp->mpccc.m_nEstAdapt;
+	double C_share_rate = r_max / n_adapt;
+	double r0_n_cur = qp->mpccc.m_curRate.GetBitRate() / r_max;
+
+	double new_rate;
+	if (qp->mpccc.m_uMinCnt >= T_probe) {
+		// Recovery mode: bypass MPC, hold at C_share
+		new_rate = C_share_rate;
+		qp->mpccc.m_uMinCnt++;
+		if (qp->mpccc.m_uMinCnt >= T_probe + N_recover)
+			qp->mpccc.m_uMinCnt = 0;  // exit recovery, re-enter normal MPC
+	} else if (!in_mpc){
+		// Probe phase: no congestion detected → likely fewer flows competing.
+		// Decay N_est aggressively so remaining flows can claim larger share.
+		n_adapt = std::max(1.0, n_adapt * 0.70);
+		qp->mpccc.m_nEstAdapt = n_adapt;
+		new_rate = qp->mpccc.m_curRate.GetBitRate() * (1.0 + m_mpccc_ai);
+		new_rate = std::min(new_rate, r_max);
+		qp->mpccc.m_uMinCnt = 0;
+	} else {
+		// MPC phase: congestion present → keep N_est stable (MPC solver handles rate)
+		// MPC phase: normalized gradient-projection solver
+		int P = (int)m_mpccc_horizon;
+		double q0_n    = q_est / bdp;
+		double r0_n    = qp->mpccc.m_curRate.GetBitRate() / r_max;
+		double C_share = 1.0 / n_adapt; // fair-share in normalized units
+		double lr      = 0.01;
+
+		// fixed-size array (P ≤ 32)
+		double U[32], grad[32];
+		if (P > 32) P = 32;
+		for (int i = 0; i < P; i++) U[i] = r0_n < 0.01 ? 0.01 : (r0_n > 1.0 ? 1.0 : r0_n);
+
+		for (int iter = 0; iter < 60; iter++){
+			for (int i = 0; i < P; i++) grad[i] = 0.0;
+			double q = q0_n;
+			for (int i = 0; i < P; i++){
+				double q_n = q + U[i] - C_share;
+				if (q_n < 0.0) q_n = 0.0;
+				// queue deviation gradient
+				grad[i] += 2.0 * m_mpccc_wq * (q_n - m_mpccc_q_ref);
+				// rate smoothness gradient
+				double u_im1 = (i == 0) ? r0_n : U[i-1];
+				grad[i] += 2.0 * m_mpccc_wdu * (U[i] - u_im1);
+				if (i > 0) grad[i-1] -= 2.0 * m_mpccc_wdu * (U[i] - u_im1);
+				q = q_n;
+			}
+			for (int i = 0; i < P; i++){
+				U[i] -= lr * grad[i];
+				if (U[i] < 0.01) U[i] = 0.01;
+				if (U[i] > 1.0)  U[i] = 1.0;
+			}
+		}
+		new_rate = U[0] * r_max;
+		if (new_rate < r_min) new_rate = r_min;
+		if (new_rate > r_max) new_rate = r_max;
+
+		// Update starvation counter based on rate output
+		if (r0_n_cur <= 0.011)
+			qp->mpccc.m_uMinCnt++;
+		else
+			qp->mpccc.m_uMinCnt = 0;
+	}
+
+	// ── Update state ────────────────────────────────────────────────────
+	qp->m_rate = DataRate((uint64_t)new_rate);
+	qp->mpccc.m_curRate = qp->m_rate;
+	qp->mpccc.m_lastRtt = rtt;
+	qp->mpccc.m_lastUpdateSeq = qp->snd_nxt;
+	qp->mpccc.m_ecnCnt = 0;
+	qp->mpccc.m_batchSize = (qp->snd_nxt - ack_seq) / m_mtu + 1;
+}
+
+/**********************
+ * RECC (CC_MODE=11)
+ * Three-phase RTT+ECN CC: fast detection / convergence / congestion avoidance
+ * No INT required; pure host-side; edge-aware ms-level RTT
+ **********************/
+void RdmaHw::HandleAckRecc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch){
+	uint32_t ack_seq = ch.ack.seq;
+	uint8_t cnp = (ch.ack.flags >> qbbHeader::FLAG_CNP) & 1;
+
+	// RTT measurement from TS header (requires IntHeader::TS mode)
+	uint64_t rtt = Simulator::Now().GetTimeStep() - ch.ack.ih.ts;
+	if (rtt == 0) rtt = 1;
+
+	// Update dynamic RTT_base (minimum measured RTT)
+	if (qp->recc.m_rttMin == 0 || rtt < qp->recc.m_rttMin)
+		qp->recc.m_rttMin = rtt;
+	uint64_t rtt_base = qp->recc.m_rttMin;
+	uint64_t now = Simulator::Now().GetTimeStep();
+	uint64_t gate = rtt_base > 0 ? rtt_base : 12000;
+
+	// CNP fast path: R_c = R_c × dec_max (rate-limited to once per RTT_base)
+	// CNP and RTT-probe updates are independent events — return after CNP to avoid
+	// double decrease when both CNP and Phase-3 would apply to the same ACK.
+	if (cnp){
+		if (now - qp->recc.m_tDec >= gate){
+			uint64_t new_rate = std::max(
+				m_minRate.GetBitRate(),
+				(uint64_t)(qp->recc.m_curRate.GetBitRate() * m_recc_decMax));
+			qp->recc.m_curRate = DataRate(new_rate);
+			qp->m_rate = qp->recc.m_curRate;
+			qp->recc.m_targetRate = qp->recc.m_curRate;
+			qp->recc.m_cnt = 1;
+			qp->recc.m_tDec = now;
+			qp->recc.m_tUpdate = now;  // block RTT update until next RTT window
+		}
+		return;
+	}
+
+	// Time-based RTT gate: RTT-based update at most once per RTT_base interval
+	if (now - qp->recc.m_tUpdate < gate)
+		return;
+
+	// HBS: detect off-phase (bytes ACKed since last update vs expected at R_c)
+	uint32_t bytes_acked = ack_seq - qp->recc.m_lastUpdateSeq;
+	double expected = m_recc_gamma * (double)rtt * 1e-9 *
+	                  (double)qp->recc.m_curRate.GetBitRate() / 8.0;
+	bool can_increase = ((double)bytes_acked >= expected);
+
+	// RTT thresholds
+	uint64_t rtt_low    = (uint64_t)(rtt_base * (1.0 + m_recc_sigma));
+	uint64_t rtt_target = (uint64_t)(rtt_low  * (1.0 + (double)m_recc_k * m_recc_sigma));
+	uint64_t line_rate  = qp->m_max_rate.GetBitRate();
+
+	if (rtt < rtt_low){
+		// Phase 1: Fast Detection — exponential rate increase
+		if (can_increase){
+			uint64_t inc = m_recc_rai.GetBitRate() * (uint64_t)qp->recc.m_cnt;
+			uint64_t new_target = qp->recc.m_targetRate.GetBitRate() + inc;
+			if (new_target > line_rate) new_target = line_rate;
+			qp->recc.m_targetRate = DataRate(new_target);
+			uint64_t new_rate = (qp->recc.m_targetRate.GetBitRate() +
+			                     qp->recc.m_curRate.GetBitRate()) / 2;
+			qp->recc.m_curRate = DataRate(new_rate);
+			qp->m_rate = qp->recc.m_curRate;
+			if (qp->recc.m_cnt < m_recc_maxCnt)
+				qp->recc.m_cnt++;
+		}
+	}else if (rtt < rtt_target){
+		// Phase 2: Convergence — linear rate increase
+		if (can_increase){
+			uint64_t new_target = qp->recc.m_targetRate.GetBitRate() + m_recc_rai.GetBitRate();
+			if (new_target > line_rate) new_target = line_rate;
+			qp->recc.m_targetRate = DataRate(new_target);
+			uint64_t new_rate = (qp->recc.m_targetRate.GetBitRate() +
+			                     qp->recc.m_curRate.GetBitRate()) / 2;
+			qp->recc.m_curRate = DataRate(new_rate);
+			qp->m_rate = qp->recc.m_curRate;
+			qp->recc.m_cnt = 1;
+		}
+	}else{
+		// Phase 3: Congestion Avoidance — multiplicative decrease
+		double ratio = (double)(rtt - rtt_target) / (double)rtt;
+		double dec_percent = std::max(m_recc_decMax, 1.0 - m_recc_beta * ratio);
+		qp->recc.m_targetRate = qp->recc.m_curRate;
+		uint64_t new_rate = std::max(
+			m_minRate.GetBitRate(),
+			(uint64_t)(qp->recc.m_curRate.GetBitRate() * dec_percent));
+		qp->recc.m_curRate = DataRate(new_rate);
+		qp->m_rate = qp->recc.m_curRate;
+		qp->recc.m_cnt = 1;
+		qp->recc.m_tDec = now;
+	}
+
+	// Update per-RTT state
+	qp->recc.m_lastRtt = rtt;
+	qp->recc.m_lastUpdateSeq = ack_seq;
+	qp->recc.m_tUpdate = now;
 }
 
 }

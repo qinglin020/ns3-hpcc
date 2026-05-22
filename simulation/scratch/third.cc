@@ -70,6 +70,24 @@ double u_target = 0.95;
 uint32_t int_multi = 1;
 bool rate_bound = true;
 
+// MPC-CC parameters
+double mpccc_ai   = 0.3;
+double mpccc_wq   = 1.0;
+double mpccc_wdu  = 0.01;
+double mpccc_q_low = 0.1;
+double mpccc_q_ref = 0.2;
+double mpccc_n_est = 4.0;
+uint32_t mpccc_horizon = 8;
+
+// RECC parameters (CC_MODE=11)
+double   recc_sigma   = 0.2;
+uint32_t recc_k       = 1;
+std::string recc_rai  = "100Mb/s";
+uint32_t recc_maxCnt  = 20;
+double   recc_beta    = 0.5;
+double   recc_decMax  = 0.5;
+double   recc_gamma   = 0.5;
+
 uint32_t ack_high_prio = 0;
 uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
@@ -650,6 +668,48 @@ int main(int argc, char *argv[])
 			}else if (key.compare("PINT_PROB") == 0){
 				conf >> pint_prob;
 				std::cout << "PINT_PROB\t\t\t\t" << pint_prob << '\n';
+			}else if (key.compare("MPCCC_AI") == 0){
+				conf >> mpccc_ai;
+				std::cout << "MPCCC_AI\t\t\t\t" << mpccc_ai << '\n';
+			}else if (key.compare("MPCCC_WQ") == 0){
+				conf >> mpccc_wq;
+				std::cout << "MPCCC_WQ\t\t\t\t" << mpccc_wq << '\n';
+			}else if (key.compare("MPCCC_WDU") == 0){
+				conf >> mpccc_wdu;
+				std::cout << "MPCCC_WDU\t\t\t\t" << mpccc_wdu << '\n';
+			}else if (key.compare("MPCCC_Q_LOW") == 0){
+				conf >> mpccc_q_low;
+				std::cout << "MPCCC_Q_LOW\t\t\t\t" << mpccc_q_low << '\n';
+			}else if (key.compare("MPCCC_Q_REF") == 0){
+				conf >> mpccc_q_ref;
+				std::cout << "MPCCC_Q_REF\t\t\t\t" << mpccc_q_ref << '\n';
+			}else if (key.compare("MPCCC_N_EST") == 0){
+				conf >> mpccc_n_est;
+				std::cout << "MPCCC_N_EST\t\t\t\t" << mpccc_n_est << '\n';
+			}else if (key.compare("MPCCC_HORIZON") == 0){
+				conf >> mpccc_horizon;
+				std::cout << "MPCCC_HORIZON\t\t\t\t" << mpccc_horizon << '\n';
+			}else if (key.compare("RECC_SIGMA") == 0){
+				conf >> recc_sigma;
+				std::cout << "RECC_SIGMA\t\t\t\t" << recc_sigma << '\n';
+			}else if (key.compare("RECC_K") == 0){
+				conf >> recc_k;
+				std::cout << "RECC_K\t\t\t\t" << recc_k << '\n';
+			}else if (key.compare("RECC_RAI") == 0){
+				conf >> recc_rai;
+				std::cout << "RECC_RAI\t\t\t\t" << recc_rai << '\n';
+			}else if (key.compare("RECC_MAX_CNT") == 0){
+				conf >> recc_maxCnt;
+				std::cout << "RECC_MAX_CNT\t\t\t\t" << recc_maxCnt << '\n';
+			}else if (key.compare("RECC_BETA") == 0){
+				conf >> recc_beta;
+				std::cout << "RECC_BETA\t\t\t\t" << recc_beta << '\n';
+			}else if (key.compare("RECC_DEC_MAX") == 0){
+				conf >> recc_decMax;
+				std::cout << "RECC_DEC_MAX\t\t\t\t" << recc_decMax << '\n';
+			}else if (key.compare("RECC_GAMMA") == 0){
+				conf >> recc_gamma;
+				std::cout << "RECC_GAMMA\t\t\t\t" << recc_gamma << '\n';
 			}
 			fflush(stdout);
 		}
@@ -673,6 +733,8 @@ int main(int argc, char *argv[])
 	IntHop::multi = int_multi;
 	// IntHeader::mode
 	if (cc_mode == 7) // timely, use ts
+		IntHeader::mode = IntHeader::TS;
+	else if (cc_mode == 11) // recc, use ts
 		IntHeader::mode = IntHeader::TS;
 	else if (cc_mode == 3) // hpcc, use int
 		IntHeader::mode = IntHeader::NORMAL;
@@ -881,6 +943,20 @@ int main(int argc, char *argv[])
 			rdmaHw->SetAttribute("RateBound", BooleanValue(rate_bound));
 			rdmaHw->SetAttribute("DctcpRateAI", DataRateValue(DataRate(dctcp_rate_ai)));
 			rdmaHw->SetPintSmplThresh(pint_prob);
+			rdmaHw->SetAttribute("MpcCcAI",      DoubleValue(mpccc_ai));
+			rdmaHw->SetAttribute("MpcCcWq",      DoubleValue(mpccc_wq));
+			rdmaHw->SetAttribute("MpcCcWdu",     DoubleValue(mpccc_wdu));
+			rdmaHw->SetAttribute("MpcCcQLow",    DoubleValue(mpccc_q_low));
+			rdmaHw->SetAttribute("MpcCcQRef",    DoubleValue(mpccc_q_ref));
+			rdmaHw->SetAttribute("MpcCcNEst",    DoubleValue(mpccc_n_est));
+			rdmaHw->SetAttribute("MpcCcHorizon", UintegerValue(mpccc_horizon));
+			rdmaHw->SetAttribute("ReccSigma",    DoubleValue(recc_sigma));
+			rdmaHw->SetAttribute("ReccK",        UintegerValue(recc_k));
+			rdmaHw->SetAttribute("ReccRai",      DataRateValue(DataRate(recc_rai)));
+			rdmaHw->SetAttribute("ReccMaxCnt",   UintegerValue(recc_maxCnt));
+			rdmaHw->SetAttribute("ReccBeta",     DoubleValue(recc_beta));
+			rdmaHw->SetAttribute("ReccDecMax",   DoubleValue(recc_decMax));
+			rdmaHw->SetAttribute("ReccGamma",    DoubleValue(recc_gamma));
 			// create and install RdmaDriver
 			Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
 			Ptr<Node> node = n.Get(i);

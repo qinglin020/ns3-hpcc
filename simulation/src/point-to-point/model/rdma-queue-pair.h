@@ -79,6 +79,25 @@ public:
 		DataRate m_curRate;
 		uint32_t m_incStage;
 	}hpccPint;
+	struct{
+		uint32_t m_lastUpdateSeq;
+		DataRate m_curRate;
+		uint64_t m_lastRtt;
+		uint32_t m_ecnCnt;
+		uint32_t m_batchSize;
+		uint32_t m_uMinCnt;    // consecutive RTTs at u_min (starvation probe)
+		double   m_nEstAdapt;  // adaptive N_est (tracks actual active flow count)
+	}mpccc;
+	struct{
+		DataRate m_curRate;       // R_c: current rate
+		DataRate m_targetRate;    // R_t: target rate
+		uint64_t m_rttMin;        // dynamically tracked minimum RTT (ns) = RTT_base
+		uint64_t m_lastRtt;       // last measured RTT (ns)
+		uint32_t m_cnt;           // consecutive increase step counter
+		uint64_t m_tDec;          // GetTimeStep() at last CNP decrease
+		uint64_t m_tUpdate;       // GetTimeStep() at last RTT-based update (time gate)
+		uint32_t m_lastUpdateSeq; // ack_seq at last rate update (for HBS bytes_acked)
+	}recc;
 
 	/***********
 	 * methods

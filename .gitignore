@@ -1,0 +1,8 @@
+# Build artifacts
+simulation/build/
+simulation/.lock-waf_linux2_build
+simulation/.waf-*/
+simulation/.waf3-*/
+
+# Python bytecode
+*.pyc

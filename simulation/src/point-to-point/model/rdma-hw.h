@@ -150,6 +150,31 @@ public:
 	void SetPintSmplThresh(double p);
 	void HandleAckHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
 	void UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch, bool fast_react);
+
+	/**********************
+	 * MPC-CC
+	 *********************/
+	double m_mpccc_ai;        // probe increase ratio per RTT
+	double m_mpccc_wq;        // queue deviation weight
+	double m_mpccc_wdu;       // rate smoothness weight
+	double m_mpccc_q_low;     // probe threshold (fraction of BDP)
+	double m_mpccc_q_ref;     // MPC target queue (normalized by BDP)
+	double m_mpccc_n_est;     // estimated competing flow count
+	uint32_t m_mpccc_horizon; // MPC prediction horizon
+	void HandleAckMpcCc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
+
+	/**********************
+	 * RECC (CC_MODE=11)
+	 * Three-phase RTT+ECN CC, no INT, pure host-side
+	 *********************/
+	double   m_recc_sigma;   // RTT band factor σ (default 0.2)
+	uint32_t m_recc_k;       // target RTT multiplier k (default 1)
+	DataRate m_recc_rai;     // additive increase step R_ai (default 100Mbps)
+	uint32_t m_recc_maxCnt;  // maximum cnt counter (default 20)
+	double   m_recc_beta;    // rate decrease factor β (default 0.5)
+	double   m_recc_decMax;  // maximum decrease factor (default 0.5)
+	double   m_recc_gamma;   // HBS correction factor γ (default 0.5)
+	void HandleAckRecc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
 };
 
 } /* namespace ns3 */
