@@ -98,6 +98,37 @@ public:
 		uint64_t m_tUpdate;       // GetTimeStep() at last RTT-based update (time gate)
 		uint32_t m_lastUpdateSeq; // ack_seq at last rate update (for HBS bytes_acked)
 	}recc;
+	/* RDI (CC_MODE=12/13) — independent state, no field reused from mlx/tmly */
+	struct{
+		DataRate m_targetRate;
+		EventId  m_eventUpdateAlpha;
+		double   m_alpha;
+		bool     m_alpha_cnp_arrived;
+		bool     m_first_cnp;
+		EventId  m_eventDecreaseRate;
+		bool     m_decrease_cnp_arrived;
+		uint32_t m_rpTimeStage;
+		EventId  m_rpTimer;
+	}mlxRdi;
+	struct{
+		uint32_t m_lastUpdateSeq;
+		DataRate m_curRate;
+		uint32_t m_incStage;
+		uint64_t lastRtt;
+		double   rttDiff;
+	}tmlyRdi;
+	struct{
+		// RDI Sender mode core fields (Alg.1 + Alg.2)
+		uint64_t m_lastUpdateTime; // last RDI period boundary (ns)
+		uint32_t m_prevSeq;        // ACK seq at last period boundary
+		DataRate m_recvRate;       // computed receive rate
+		DataRate m_guideRate;      // EMA-smoothed guide rate
+		uint32_t m_degree;         // congestion degree (Alg.3/Alg.4)
+		bool     m_congInPeriod;   // any congestion observed within current period (resets every T)
+		// Alg.3 specific (Timely): RTT diff EMA
+		double   m_rttDiff;        // smoothed RTT diff
+		uint64_t m_prevRtt;        // last seen RTT
+	}rdiSender;
 
 	/***********
 	 * methods

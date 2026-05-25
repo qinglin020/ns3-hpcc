@@ -175,6 +175,33 @@ public:
 	double   m_recc_decMax;  // maximum decrease factor (default 0.5)
 	double   m_recc_gamma;   // HBS correction factor γ (default 0.5)
 	void HandleAckRecc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
+
+	/**********************
+	 * RDI (CC_MODE=12 DCQCN+RDI, CC_MODE=13 Timely+RDI)
+	 * Receiver-Driven Information Guided Enhancement (NOMS 2024)
+	 * Sender mode — derive recvRate from ACK seq, replace decrease rate with guideRate.
+	 * All state lives in mlxRdi/tmlyRdi/rdiSender; no field shared with mlx/tmly.
+	 *********************/
+	uint64_t m_rdi_T;         // sampling period (ns), default 50000 = 50μs
+	double   m_rdi_baseValue; // BaseValue in Alg.2, default 1.0
+	double   m_rdi_beta;      // EMA smoothing factor RDI_Beta, default 0.5
+	// DCQCN+RDI (CC_MODE=12)
+	void HandleAckDcqcnRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
+	void UpdateAlphaMlxRdi(Ptr<RdmaQueuePair> q);
+	void ScheduleUpdateAlphaMlxRdi(Ptr<RdmaQueuePair> q);
+	void cnp_received_mlx_rdi(Ptr<RdmaQueuePair> q);
+	void CheckRateDecreaseMlxRdi(Ptr<RdmaQueuePair> q);
+	void ScheduleDecreaseRateMlxRdi(Ptr<RdmaQueuePair> q, uint32_t delta);
+	void RateIncEventTimerMlxRdi(Ptr<RdmaQueuePair> q);
+	void RateIncEventMlxRdi(Ptr<RdmaQueuePair> q);
+	void FastRecoveryMlxRdi(Ptr<RdmaQueuePair> q);
+	void ActiveIncreaseMlxRdi(Ptr<RdmaQueuePair> q);
+	void HyperIncreaseMlxRdi(Ptr<RdmaQueuePair> q);
+	// Timely+RDI (CC_MODE=13)
+	void HandleAckTimelyRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
+	void UpdateRateTimelyRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch, bool us);
+	// RDI shared core (Sender mode)
+	void RdiUpdateSender(Ptr<RdmaQueuePair> qp, uint32_t ack_seq, bool congested);
 };
 
 } /* namespace ns3 */

@@ -244,6 +244,21 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.5),
 				MakeDoubleAccessor(&RdmaHw::m_recc_gamma),
 				MakeDoubleChecker<double>())
+		.AddAttribute("RdiT",
+				"RDI sampling period T in nanoseconds (default 50000 = 50us)",
+				UintegerValue(50000),
+				MakeUintegerAccessor(&RdmaHw::m_rdi_T),
+				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("RdiBaseValue",
+				"RDI BaseValue (Alg.2 rate-adjustment base, default 1.0)",
+				DoubleValue(1.0),
+				MakeDoubleAccessor(&RdmaHw::m_rdi_baseValue),
+				MakeDoubleChecker<double>())
+		.AddAttribute("RdiBeta",
+				"RDI Beta (Alg.2 EMA smoothing, default 0.5)",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_rdi_beta),
+				MakeDoubleChecker<double>())
 		;
 	return tid;
 }
@@ -329,6 +344,10 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 		qp->recc.m_targetRate = m_bps;
 		qp->recc.m_cnt = 1;
 		qp->recc.m_rttMin = qp->m_baseRtt;
+	}else if (m_cc_mode == 12){
+		qp->mlxRdi.m_targetRate = m_bps;
+	}else if (m_cc_mode == 13){
+		qp->tmlyRdi.m_curRate = m_bps;
 	}
 
 	// Notify Nic
@@ -467,6 +486,10 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch){
 			qp->recc.m_targetRate = dev->GetDataRate();
 			qp->recc.m_cnt = 1;
 			qp->recc.m_rttMin = qp->m_baseRtt;
+		}else if (m_cc_mode == 12){
+			qp->mlxRdi.m_targetRate = dev->GetDataRate();
+		}else if (m_cc_mode == 13){
+			qp->tmlyRdi.m_curRate = dev->GetDataRate();
 		}
 	}
 	return 0;
@@ -521,6 +544,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		HandleAckHpPint(qp, p, ch);
 	}else if (m_cc_mode == 11){
 		HandleAckRecc(qp, p, ch);
+	}else if (m_cc_mode == 12){
+		HandleAckDcqcnRdi(qp, p, ch);
+	}else if (m_cc_mode == 13){
+		HandleAckTimelyRdi(qp, p, ch);
 	}
 	// ACK may advance the on-the-fly window, allowing more packets to send
 	dev->TriggerTransmit();
@@ -592,6 +619,10 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
 		Simulator::Cancel(qp->mlx.m_rpTimer);
+	}else if (m_cc_mode == 12){
+		Simulator::Cancel(qp->mlxRdi.m_eventUpdateAlpha);
+		Simulator::Cancel(qp->mlxRdi.m_eventDecreaseRate);
+		Simulator::Cancel(qp->mlxRdi.m_rpTimer);
 	}
 
 	// This callback will log info
@@ -1419,6 +1450,262 @@ void RdmaHw::HandleAckRecc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &c
 	qp->recc.m_lastRtt = rtt;
 	qp->recc.m_lastUpdateSeq = ack_seq;
 	qp->recc.m_tUpdate = now;
+}
+
+/**********************
+ * RDI (CC_MODE=12 DCQCN+RDI, CC_MODE=13 Timely+RDI)
+ * Receiver-Driven Information Guided Enhancement (NOMS 2024)
+ * Sender mode — derive recvRate from ACK seq differences, replace the
+ * decrease rate of the underlying CC with the EMA-smoothed guide rate.
+ *
+ * All state stored in mlxRdi / tmlyRdi / rdiSender. No DCQCN/Timely
+ * mlx/tmly fields are touched by this code path.
+ *********************/
+
+/* Alg.1 (Runtime Collector) + Alg.2 (Rate Calculator) shared core.
+ * Caller passes whether this ACK observed congestion; the function
+ * accumulates within the period and updates state at period boundary T. */
+void RdmaHw::RdiUpdateSender(Ptr<RdmaQueuePair> qp, uint32_t ack_seq, bool congested_this_ack){
+	if (congested_this_ack)
+		qp->rdiSender.m_congInPeriod = true;
+
+	uint64_t now = Simulator::Now().GetTimeStep();
+	if (qp->rdiSender.m_lastUpdateTime == 0){
+		qp->rdiSender.m_lastUpdateTime = now;
+		qp->rdiSender.m_prevSeq = ack_seq;
+		qp->rdiSender.m_congInPeriod = false;
+		return;
+	}
+	uint64_t elapsed_ns = now - qp->rdiSender.m_lastUpdateTime;
+	if (elapsed_ns < m_rdi_T)
+		return;
+
+	// Alg.1: recvRate = bytes_acked / T (bps)
+	uint64_t bytes_acked = ack_seq - qp->rdiSender.m_prevSeq;
+	uint64_t recvRate_bps = (uint64_t)((double)bytes_acked * 8.0 * 1e9 / (double)elapsed_ns);
+	qp->rdiSender.m_recvRate = DataRate(recvRate_bps);
+
+	// Alg.3/Alg.4 — degree
+	if (qp->rdiSender.m_congInPeriod)
+		qp->rdiSender.m_degree++;
+	else
+		qp->rdiSender.m_degree = 1;
+	// Cap degree so factor = BaseValue*(1-degree/10) >= 0.5.
+	// degree>5 → factor<0.5 → guide < 0.5*recvRate, which is MORE aggressive
+	// than DCQCN's alpha formula (rate * (1-alpha/2) ≈ rate*0.5) for sustained
+	// congestion. This causes guide to undercut DCQCN's own reduction, stalling
+	// large flows. Capping at 5 ensures guide >= 0.5*recvRate — roughly matching
+	// DCQCN's floor while still converging faster on the initial burst.
+	if (qp->rdiSender.m_degree > 5)
+		qp->rdiSender.m_degree = 5;
+
+	// Alg.2 — RDI_factor and guideRate
+	double rdi_factor = m_rdi_baseValue * (1.0 - (double)qp->rdiSender.m_degree / 10.0);
+	if (rdi_factor < 0.0) rdi_factor = 0.0;
+	uint64_t new_guide_bps = (uint64_t)((double)recvRate_bps * rdi_factor);
+	uint64_t prev_guide_bps = qp->rdiSender.m_guideRate.GetBitRate();
+	uint64_t guide_bps;
+	if (prev_guide_bps == 0)
+		guide_bps = new_guide_bps;
+	else
+		guide_bps = (uint64_t)((1.0 - m_rdi_beta) * (double)prev_guide_bps
+		                      + m_rdi_beta        * (double)new_guide_bps);
+	qp->rdiSender.m_guideRate = DataRate(guide_bps);
+
+	qp->rdiSender.m_lastUpdateTime = now;
+	qp->rdiSender.m_prevSeq = ack_seq;
+	qp->rdiSender.m_congInPeriod = false;
+}
+
+/* ===== DCQCN + RDI (CC_MODE=12) — full DCQCN(mlx) timer machinery,
+ *       copied with `_Rdi` suffix; only CheckRateDecreaseMlxRdi replaces
+ *       the decrease formula with guideRate. =====
+ */
+
+void RdmaHw::UpdateAlphaMlxRdi(Ptr<RdmaQueuePair> q){
+	if (q->mlxRdi.m_alpha_cnp_arrived){
+		q->mlxRdi.m_alpha = (1 - m_g) * q->mlxRdi.m_alpha + m_g;
+	}else{
+		q->mlxRdi.m_alpha = (1 - m_g) * q->mlxRdi.m_alpha;
+	}
+	q->mlxRdi.m_alpha_cnp_arrived = false;
+	ScheduleUpdateAlphaMlxRdi(q);
+}
+void RdmaHw::ScheduleUpdateAlphaMlxRdi(Ptr<RdmaQueuePair> q){
+	q->mlxRdi.m_eventUpdateAlpha = Simulator::Schedule(MicroSeconds(m_alpha_resume_interval),
+	                                                    &RdmaHw::UpdateAlphaMlxRdi, this, q);
+}
+
+void RdmaHw::cnp_received_mlx_rdi(Ptr<RdmaQueuePair> q){
+	q->mlxRdi.m_alpha_cnp_arrived = true;
+	q->mlxRdi.m_decrease_cnp_arrived = true;
+	if (q->mlxRdi.m_first_cnp){
+		q->mlxRdi.m_alpha = 1;
+		q->mlxRdi.m_alpha_cnp_arrived = false;
+		ScheduleUpdateAlphaMlxRdi(q);
+		ScheduleDecreaseRateMlxRdi(q, 1);
+		q->mlxRdi.m_targetRate = q->m_rate = m_rateOnFirstCNP * q->m_rate;
+		q->mlxRdi.m_first_cnp = false;
+	}
+}
+
+/* KEY INTERVENTION POINT: decrease rate replaced by RDI guideRate. */
+void RdmaHw::CheckRateDecreaseMlxRdi(Ptr<RdmaQueuePair> q){
+	ScheduleDecreaseRateMlxRdi(q, 0);
+	if (q->mlxRdi.m_decrease_cnp_arrived){
+		bool clamp = true;
+		if (!m_EcnClampTgtRate){
+			if (q->mlxRdi.m_rpTimeStage == 0)
+				clamp = false;
+		}
+		if (clamp)
+			q->mlxRdi.m_targetRate = q->m_rate;
+
+		// RDI replacement: use guideRate instead of alpha-based decrease
+		uint64_t guide_bps = q->rdiSender.m_guideRate.GetBitRate();
+		if (guide_bps > 0){
+			uint64_t new_rate = std::max(m_minRate.GetBitRate(), guide_bps);
+			q->m_rate = DataRate(new_rate);
+		}else{
+			// guideRate not yet ready: fall back to DCQCN's alpha-based decrease
+			q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlxRdi.m_alpha / 2));
+		}
+		q->mlxRdi.m_rpTimeStage = 0;
+		q->mlxRdi.m_decrease_cnp_arrived = false;
+		Simulator::Cancel(q->mlxRdi.m_rpTimer);
+		q->mlxRdi.m_rpTimer = Simulator::Schedule(MicroSeconds(m_rpgTimeReset),
+		                                          &RdmaHw::RateIncEventTimerMlxRdi, this, q);
+	}
+}
+void RdmaHw::ScheduleDecreaseRateMlxRdi(Ptr<RdmaQueuePair> q, uint32_t delta){
+	q->mlxRdi.m_eventDecreaseRate = Simulator::Schedule(MicroSeconds(m_rateDecreaseInterval) + NanoSeconds(delta),
+	                                                    &RdmaHw::CheckRateDecreaseMlxRdi, this, q);
+}
+
+void RdmaHw::RateIncEventTimerMlxRdi(Ptr<RdmaQueuePair> q){
+	q->mlxRdi.m_rpTimer = Simulator::Schedule(MicroSeconds(m_rpgTimeReset),
+	                                          &RdmaHw::RateIncEventTimerMlxRdi, this, q);
+	RateIncEventMlxRdi(q);
+	q->mlxRdi.m_rpTimeStage++;
+}
+void RdmaHw::RateIncEventMlxRdi(Ptr<RdmaQueuePair> q){
+	if (q->mlxRdi.m_rpTimeStage < m_rpgThreshold){
+		FastRecoveryMlxRdi(q);
+	}else if (q->mlxRdi.m_rpTimeStage == m_rpgThreshold){
+		ActiveIncreaseMlxRdi(q);
+	}else{
+		HyperIncreaseMlxRdi(q);
+	}
+}
+void RdmaHw::FastRecoveryMlxRdi(Ptr<RdmaQueuePair> q){
+	q->m_rate = (q->m_rate / 2) + (q->mlxRdi.m_targetRate / 2);
+}
+void RdmaHw::ActiveIncreaseMlxRdi(Ptr<RdmaQueuePair> q){
+	uint32_t nic_idx = GetNicIdxOfQp(q);
+	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
+	q->mlxRdi.m_targetRate += m_rai;
+	if (q->mlxRdi.m_targetRate > dev->GetDataRate())
+		q->mlxRdi.m_targetRate = dev->GetDataRate();
+	q->m_rate = (q->m_rate / 2) + (q->mlxRdi.m_targetRate / 2);
+}
+void RdmaHw::HyperIncreaseMlxRdi(Ptr<RdmaQueuePair> q){
+	uint32_t nic_idx = GetNicIdxOfQp(q);
+	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
+	q->mlxRdi.m_targetRate += m_rhai;
+	if (q->mlxRdi.m_targetRate > dev->GetDataRate())
+		q->mlxRdi.m_targetRate = dev->GetDataRate();
+	q->m_rate = (q->m_rate / 2) + (q->mlxRdi.m_targetRate / 2);
+}
+
+/* DCQCN+RDI entry — observes ECN to feed RDI degree, hands CNP to mlx_rdi path. */
+void RdmaHw::HandleAckDcqcnRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch){
+	uint32_t ack_seq = ch.ack.seq;
+	uint8_t cnp = (ch.ack.flags >> qbbHeader::FLAG_CNP) & 1;
+	// RDI Sender state update (Alg.1 + Alg.4 + Alg.2); ECN is the congestion signal for DCQCN.
+	RdiUpdateSender(qp, ack_seq, cnp != 0);
+	if (cnp){
+		cnp_received_mlx_rdi(qp);
+	}
+}
+
+/* ===== Timely + RDI (CC_MODE=13) — copy of HandleAckTimely + UpdateRateTimely;
+ *       the decrease branch substitutes guideRate. =====
+ */
+
+void RdmaHw::HandleAckTimelyRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch){
+	uint32_t ack_seq = ch.ack.seq;
+	if (ack_seq > qp->tmlyRdi.m_lastUpdateSeq){
+		UpdateRateTimelyRdi(qp, p, ch, false);
+	}
+	// fast-react path intentionally empty (mirrors FastReactTimely)
+}
+
+void RdmaHw::UpdateRateTimelyRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch, bool us){
+	uint32_t next_seq = qp->snd_nxt;
+	uint64_t rtt = Simulator::Now().GetTimeStep() - ch.ack.ih.ts;
+	uint32_t ack_seq = ch.ack.seq;
+
+	if (qp->tmlyRdi.m_lastUpdateSeq != 0){
+		int64_t new_rtt_diff = (int64_t)rtt - (int64_t)qp->tmlyRdi.lastRtt;
+		double rtt_diff = (1 - m_tmly_alpha) * qp->tmlyRdi.rttDiff + m_tmly_alpha * new_rtt_diff;
+		double gradient = rtt_diff / (double)m_tmly_minRtt;
+		bool inc = false;
+		double c = 0;
+
+		// Alg.3 — degree fed by Timely's RTT gradient + T_High check
+		bool congested = (rtt_diff >= 0.0) && (rtt > m_tmly_THigh);
+		RdiUpdateSender(qp, ack_seq, congested);
+
+		if (rtt < m_tmly_TLow){
+			inc = true;
+		}else if (rtt > m_tmly_THigh){
+			c = 1 - m_tmly_beta * (1 - (double)m_tmly_THigh / rtt);
+			inc = false;
+		}else if (gradient <= 0){
+			inc = true;
+		}else{
+			c = 1 - m_tmly_beta * gradient;
+			if (c < 0) c = 0;
+			inc = false;
+		}
+
+		if (inc){
+			if (qp->tmlyRdi.m_incStage < 5){
+				qp->m_rate = qp->tmlyRdi.m_curRate + m_rai;
+			}else{
+				qp->m_rate = qp->tmlyRdi.m_curRate + m_rhai;
+			}
+			if (qp->m_rate > qp->m_max_rate)
+				qp->m_rate = qp->m_max_rate;
+			if (!us){
+				qp->tmlyRdi.m_curRate = qp->m_rate;
+				qp->tmlyRdi.m_incStage++;
+				qp->tmlyRdi.rttDiff = rtt_diff;
+			}
+		}else{
+			// KEY INTERVENTION POINT: replace Timely's c-based decrease with guideRate
+			uint64_t guide_bps = qp->rdiSender.m_guideRate.GetBitRate();
+			if (guide_bps > 0){
+				uint64_t new_rate_bps = std::max(m_minRate.GetBitRate(), guide_bps);
+				qp->m_rate = DataRate(new_rate_bps);
+			}else{
+				qp->m_rate = std::max(m_minRate, qp->tmlyRdi.m_curRate * c);
+			}
+			if (!us){
+				qp->tmlyRdi.m_curRate = qp->m_rate;
+				qp->tmlyRdi.m_incStage = 0;
+				qp->tmlyRdi.rttDiff = rtt_diff;
+			}
+		}
+	}else{
+		// First RTT — establish baseline; feed RDI with no congestion to bootstrap m_prevSeq
+		RdiUpdateSender(qp, ack_seq, false);
+	}
+
+	if (!us && next_seq > qp->tmlyRdi.m_lastUpdateSeq){
+		qp->tmlyRdi.m_lastUpdateSeq = next_seq;
+		qp->tmlyRdi.lastRtt = rtt;
+	}
 }
 
 }

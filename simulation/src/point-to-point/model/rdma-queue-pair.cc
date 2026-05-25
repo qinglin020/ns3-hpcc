@@ -73,6 +73,27 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	recc.m_tDec = 0;
 	recc.m_tUpdate = 0;
 	recc.m_lastUpdateSeq = 0;
+
+	// RDI (CC_MODE=12/13) — independent init, mirrors mlx/tmly defaults but stored separately
+	mlxRdi.m_alpha = 1;
+	mlxRdi.m_alpha_cnp_arrived = false;
+	mlxRdi.m_first_cnp = true;
+	mlxRdi.m_decrease_cnp_arrived = false;
+	mlxRdi.m_rpTimeStage = 0;
+
+	tmlyRdi.m_lastUpdateSeq = 0;
+	tmlyRdi.m_incStage = 0;
+	tmlyRdi.lastRtt = 0;
+	tmlyRdi.rttDiff = 0;
+
+	rdiSender.m_lastUpdateTime = 0;
+	rdiSender.m_prevSeq = 0;
+	rdiSender.m_recvRate = 0;
+	rdiSender.m_guideRate = 0;
+	rdiSender.m_degree = 1;
+	rdiSender.m_congInPeriod = false;
+	rdiSender.m_rttDiff = 0;
+	rdiSender.m_prevRtt = 0;
 }
 
 void RdmaQueuePair::SetSize(uint64_t size){

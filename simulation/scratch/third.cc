@@ -88,6 +88,11 @@ double   recc_beta    = 0.5;
 double   recc_decMax  = 0.5;
 double   recc_gamma   = 0.5;
 
+// RDI parameters (CC_MODE=12 DCQCN+RDI, CC_MODE=13 Timely+RDI)
+uint64_t rdi_T          = 50000;  // 50us in ns
+double   rdi_baseValue  = 1.0;
+double   rdi_beta       = 0.5;
+
 uint32_t ack_high_prio = 0;
 uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
@@ -99,6 +104,13 @@ uint32_t buffer_size = 16;
 uint32_t qlen_dump_interval = 100000000, qlen_mon_interval = 100;
 uint64_t qlen_mon_start = 2000000000, qlen_mon_end = 2100000000;
 string qlen_mon_file;
+
+// Rate trace (used by RDI incast/mixed experiments to reproduce Fig.2/6/8/9)
+uint64_t rate_trace_interval = 0;   // ns; 0 = disabled
+uint64_t rate_trace_start = 0;
+uint64_t rate_trace_end = 0;
+string rate_trace_file;
+std::vector<Ptr<RdmaHw> > g_rdmaHwList;  // populated when each RdmaHw is created
 
 unordered_map<uint64_t, uint32_t> rate2kmax, rate2kmin;
 unordered_map<uint64_t, double> rate2pmax;
@@ -236,6 +248,25 @@ void monitor_buffer(FILE* qlen_output, NodeContainer *n){
 	}
 	if (Simulator::Now().GetTimeStep() < qlen_mon_end)
 		Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer, qlen_output, n);
+}
+
+// Rate trace: every rate_trace_interval ns, dump (time, src, dst, sport, dport, rate_bps)
+// for every active QP across every host. Used for RDI incast/mixed rate-vs-time plots.
+void monitor_rate(FILE* out){
+	uint64_t now = Simulator::Now().GetTimeStep();
+	for (auto& hw : g_rdmaHwList){
+		for (auto& kv : hw->m_qpMap){
+			Ptr<RdmaQueuePair> qp = kv.second;
+			fprintf(out, "%lu %u %u %u %u %lu\n",
+				now,
+				qp->sip.Get(), qp->dip.Get(),
+				qp->sport, qp->dport,
+				qp->m_rate.GetBitRate());
+		}
+	}
+	fflush(out);
+	if (now < rate_trace_end)
+		Simulator::Schedule(NanoSeconds(rate_trace_interval), &monitor_rate, out);
 }
 
 void CalculateRoute(Ptr<Node> host){
@@ -710,6 +741,27 @@ int main(int argc, char *argv[])
 			}else if (key.compare("RECC_GAMMA") == 0){
 				conf >> recc_gamma;
 				std::cout << "RECC_GAMMA\t\t\t\t" << recc_gamma << '\n';
+			}else if (key.compare("RDI_T") == 0){
+				conf >> rdi_T;
+				std::cout << "RDI_T\t\t\t\t" << rdi_T << '\n';
+			}else if (key.compare("RDI_BASE_VALUE") == 0){
+				conf >> rdi_baseValue;
+				std::cout << "RDI_BASE_VALUE\t\t\t\t" << rdi_baseValue << '\n';
+			}else if (key.compare("RDI_BETA") == 0){
+				conf >> rdi_beta;
+				std::cout << "RDI_BETA\t\t\t\t" << rdi_beta << '\n';
+			}else if (key.compare("RATE_TRACE_INTERVAL") == 0){
+				conf >> rate_trace_interval;
+				std::cout << "RATE_TRACE_INTERVAL\t\t\t\t" << rate_trace_interval << '\n';
+			}else if (key.compare("RATE_TRACE_START") == 0){
+				conf >> rate_trace_start;
+				std::cout << "RATE_TRACE_START\t\t\t\t" << rate_trace_start << '\n';
+			}else if (key.compare("RATE_TRACE_END") == 0){
+				conf >> rate_trace_end;
+				std::cout << "RATE_TRACE_END\t\t\t\t" << rate_trace_end << '\n';
+			}else if (key.compare("RATE_TRACE_OUTPUT_FILE") == 0){
+				conf >> rate_trace_file;
+				std::cout << "RATE_TRACE_OUTPUT_FILE\t\t\t\t" << rate_trace_file << '\n';
 			}
 			fflush(stdout);
 		}
@@ -735,6 +787,8 @@ int main(int argc, char *argv[])
 	if (cc_mode == 7) // timely, use ts
 		IntHeader::mode = IntHeader::TS;
 	else if (cc_mode == 11) // recc, use ts
+		IntHeader::mode = IntHeader::TS;
+	else if (cc_mode == 13) // timely+rdi, use ts
 		IntHeader::mode = IntHeader::TS;
 	else if (cc_mode == 3) // hpcc, use int
 		IntHeader::mode = IntHeader::NORMAL;
@@ -957,6 +1011,10 @@ int main(int argc, char *argv[])
 			rdmaHw->SetAttribute("ReccBeta",     DoubleValue(recc_beta));
 			rdmaHw->SetAttribute("ReccDecMax",   DoubleValue(recc_decMax));
 			rdmaHw->SetAttribute("ReccGamma",    DoubleValue(recc_gamma));
+			rdmaHw->SetAttribute("RdiT",         UintegerValue(rdi_T));
+			rdmaHw->SetAttribute("RdiBaseValue", DoubleValue(rdi_baseValue));
+			rdmaHw->SetAttribute("RdiBeta",      DoubleValue(rdi_beta));
+			g_rdmaHwList.push_back(rdmaHw);  // for rate trace
 			// create and install RdmaDriver
 			Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
 			Ptr<Node> node = n.Get(i);
@@ -1082,6 +1140,13 @@ int main(int argc, char *argv[])
 	// schedule buffer monitor
 	FILE* qlen_output = fopen(qlen_mon_file.c_str(), "w");
 	Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output, &n);
+
+	// schedule rate trace if enabled
+	if (rate_trace_interval > 0 && !rate_trace_file.empty()){
+		FILE* rate_output = fopen(rate_trace_file.c_str(), "w");
+		fprintf(rate_output, "# time_ns sip dip sport dport rate_bps\n");
+		Simulator::Schedule(NanoSeconds(rate_trace_start), &monitor_rate, rate_output);
+	}
 
 	//
 	// Now, do the actual simulation.
