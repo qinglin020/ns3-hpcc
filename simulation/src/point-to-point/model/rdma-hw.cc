@@ -1561,13 +1561,14 @@ void RdmaHw::CheckRateDecreaseMlxRdi(Ptr<RdmaQueuePair> q){
 		if (clamp)
 			q->mlxRdi.m_targetRate = q->m_rate;
 
-		// RDI replacement: use guideRate instead of alpha-based decrease
+		// RDI v4: guideRate as UPPER BOUND only (rate only goes down, never up)
 		uint64_t guide_bps = q->rdiSender.m_guideRate.GetBitRate();
-		if (guide_bps > 0){
+		uint64_t cur_bps   = q->m_rate.GetBitRate();
+		if (guide_bps > 0 && guide_bps < cur_bps){
 			uint64_t new_rate = std::max(m_minRate.GetBitRate(), guide_bps);
 			q->m_rate = DataRate(new_rate);
 		}else{
-			// guideRate not yet ready: fall back to DCQCN's alpha-based decrease
+			// guideRate not ready OR not lower than current: fall back to DCQCN alpha decrease
 			q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlxRdi.m_alpha / 2));
 		}
 		q->mlxRdi.m_rpTimeStage = 0;
@@ -1683,9 +1684,10 @@ void RdmaHw::UpdateRateTimelyRdi(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHea
 				qp->tmlyRdi.rttDiff = rtt_diff;
 			}
 		}else{
-			// KEY INTERVENTION POINT: replace Timely's c-based decrease with guideRate
+			// RDI v4: guideRate as UPPER BOUND only (rate only goes down)
 			uint64_t guide_bps = qp->rdiSender.m_guideRate.GetBitRate();
-			if (guide_bps > 0){
+			uint64_t cur_bps   = qp->m_rate.GetBitRate();
+			if (guide_bps > 0 && guide_bps < cur_bps){
 				uint64_t new_rate_bps = std::max(m_minRate.GetBitRate(), guide_bps);
 				qp->m_rate = DataRate(new_rate_bps);
 			}else{
